@@ -241,7 +241,7 @@ jobs:
                   ));
 
                   ClientTickEvents.END_CLIENT_TICK.register(AutoLeaveClient::onTick);
-                  LOGGER.info("AutoLeave загружен, radius={}", config.radius);
+                  LOGGER.info("AutoLeave загружен, radius={}, ignore={}", config.radius, config.ignore);
               }
 
               private static void onTick(Minecraft mc) {
@@ -293,6 +293,8 @@ jobs:
 
                   if (!enabled) return;
 
+                  UUID selfId = mc.player.getUUID();
+                  String selfName = norm(mc.player.getScoreboardName());
                   Set<UUID> seen = new HashSet<>();
 
                   for (AbstractClientPlayer other : mc.level.players()) {
@@ -300,14 +302,20 @@ jobs:
 
                       UUID id = other.getUUID();
 
+                      // Никогда не реагируем на себя, даже если сервер показывает рядом копию нашего персонажа
+                      if (id.equals(selfId)) continue;
+
+                      String name = other.getName().getString();
+                      String profileName = other.getScoreboardName();
+                      if (norm(name).equals(selfName) || norm(profileName).equals(selfName)) continue;
+
                       // Только настоящие игроки из таба
                       if (mc.getConnection().getPlayerInfo(id) == null) continue;
 
                       // UUID версии 2 используют плагины NPC (Citizens и подобные), у игроков 3 или 4
                       if (id.version() == 2) continue;
 
-                      String name = other.getName().getString();
-                      if (isIgnored(name)) continue;
+                      if (isIgnored(name) || isIgnored(profileName)) continue;
 
                       seen.add(id);
 
@@ -329,8 +337,9 @@ jobs:
                       // Неподвижный игрок, который был на месте сразу при заходе/телепорте = NPC на спавне
                       if (t.arrival && !t.moved) continue;
 
-                      if (mc.player.distanceTo(other) <= config.radius) {
-                          leave(mc, name);
+                      float dist = mc.player.distanceTo(other);
+                      if (dist <= config.radius) {
+                          leave(mc, name, profileName, id, dist);
                           return;
                       }
                   }
@@ -338,19 +347,28 @@ jobs:
                   tracked.keySet().retainAll(seen);
               }
 
+              /** Убирает цветовые коды, пробелы и регистр, чтобы имена сравнивались надёжно. */
+              private static String norm(String s) {
+                  if (s == null) return "";
+                  return s.replaceAll("§.", "").trim().toLowerCase(Locale.ROOT);
+              }
+
               private static boolean isIgnored(String name) {
-                  String lower = name.toLowerCase(Locale.ROOT);
+                  String n = norm(name);
+                  if (n.isEmpty()) return false;
                   for (String ignored : config.ignore) {
-                      if (ignored != null && ignored.toLowerCase(Locale.ROOT).equals(lower)) return true;
+                      if (ignored != null && norm(ignored).equals(n)) return true;
                   }
                   return false;
               }
 
-              private static void leave(Minecraft mc, String playerName) {
-                  LOGGER.info("Рядом игрок {}, выхожу с сервера", playerName);
+              private static void leave(Minecraft mc, String name, String profileName, UUID id, float dist) {
+                  LOGGER.info("Рядом игрок name='{}' profile='{}' uuid={} dist={}, выхожу с сервера", name, profileName, id, dist);
                   enabled = false; // после возвращения мод снова выключен, чтобы не кикать в лобби
                   mc.getConnection().getConnection().disconnect(
-                          Component.literal("AutoLeave: рядом игрок " + playerName)
+                          Component.literal("AutoLeave: рядом игрок " + name
+                                  + " (профиль " + profileName + ", дистанция " + (int) dist
+                                  + ", в игнор-листе записей: " + config.ignore.size() + ")")
                   );
               }
           }
