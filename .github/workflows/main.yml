@@ -137,16 +137,19 @@ jobs:
 
           /**
            * Настройки лежат в config/autoleave.json
-           *  enabled - включён ли мод (запоминается между запусками)
-           *  radius  - дистанция в блоках, при которой срабатывает выход
-           *  ignore  - ники, которых мод игнорирует (друзья, альты)
+           *  radius               - дистанция в блоках, при которой срабатывает выход
+           *  ignore               - ники, которых мод игнорирует (друзья, альты, NPC)
+           *  arrivalGraceSeconds  - после захода в мир/телепорта столько секунд неподвижные игроки
+           *                         (то есть NPC на спавне) не считаются угрозой, пока не пошевелятся
+           *
+           * Включённость мода в конфиг НЕ сохраняется: после каждого захода он выключен.
            */
           public class AutoLeaveConfig {
               private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
               private static final Path FILE = FabricLoader.getInstance().getConfigDir().resolve("autoleave.json");
 
-              public boolean enabled = false;
               public double radius = 48.0;
+              public int arrivalGraceSeconds = 10;
               public List<String> ignore = new ArrayList<>();
 
               public static AutoLeaveConfig load() {
@@ -157,6 +160,8 @@ jobs:
                           if (cfg != null) {
                               if (cfg.ignore == null) cfg.ignore = new ArrayList<>();
                               if (cfg.radius <= 0) cfg.radius = 48.0;
+                              if (cfg.arrivalGraceSeconds < 0) cfg.arrivalGraceSeconds = 10;
+                              cfg.save();
                               return cfg;
                           }
                       } catch (Exception e) {
@@ -187,13 +192,19 @@ jobs:
           import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
           import net.minecraft.client.KeyMapping;
           import net.minecraft.client.Minecraft;
+          import net.minecraft.client.multiplayer.ClientLevel;
           import net.minecraft.client.player.AbstractClientPlayer;
           import net.minecraft.network.chat.Component;
           import org.lwjgl.glfw.GLFW;
           import org.slf4j.Logger;
           import org.slf4j.LoggerFactory;
 
+          import java.util.HashMap;
+          import java.util.HashSet;
           import java.util.Locale;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.UUID;
 
           public class AutoLeaveClient implements ClientModInitializer {
               public static final Logger LOGGER = LoggerFactory.getLogger("autoleave");
@@ -201,11 +212,27 @@ jobs:
               private static AutoLeaveConfig config;
               private static KeyMapping toggleKey;
 
+              /** Каждый запуск игры начинается с ВЫКЛ. Включается кнопкой, на фермерской точке. */
+              private static boolean enabled = false;
+
+              private static long tick = 0;
+              private static long graceUntil = 0;
+              private static ClientLevel lastLevel = null;
+              private static boolean hasLastPos = false;
+              private static double lastX, lastY, lastZ;
+
+              private static final Map<UUID, Track> tracked = new HashMap<>();
+
+              private static class Track {
+                  double x, y, z;
+                  boolean moved;
+                  boolean arrival; // впервые замечен сразу после захода/телепорта
+              }
+
               @Override
               public void onInitializeClient() {
                   config = AutoLeaveConfig.load();
 
-                  // Одна кнопка вкл/выкл. По умолчанию K, меняется в настройках управления (раздел "Прочее").
                   toggleKey = KeyBindingHelper.registerKeyBinding(new KeyMapping(
                           "key.autoleave.toggle",
                           InputConstants.Type.KEYSYM,
@@ -214,39 +241,101 @@ jobs:
                   ));
 
                   ClientTickEvents.END_CLIENT_TICK.register(AutoLeaveClient::onTick);
-                  LOGGER.info("AutoLeave загружен, enabled={}, radius={}", config.enabled, config.radius);
+                  LOGGER.info("AutoLeave загружен, radius={}", config.radius);
               }
 
               private static void onTick(Minecraft mc) {
-                  // Переключение кнопкой
+                  tick++;
+
                   while (toggleKey.consumeClick()) {
-                      config.enabled = !config.enabled;
-                      config.save();
+                      enabled = !enabled;
+                      tracked.clear();
                       if (mc.player != null) {
                           mc.player.displayClientMessage(
-                                  Component.literal("AutoLeave: " + (config.enabled ? "ВКЛ" : "ВЫКЛ")),
+                                  Component.literal("AutoLeave: " + (enabled ? "ВКЛ (радиус " + (int) config.radius + ")" : "ВЫКЛ")),
                                   true
                           );
                       }
                   }
 
-                  if (!config.enabled) return;
-                  if (mc.player == null || mc.level == null || mc.getConnection() == null) return;
+                  if (mc.player == null || mc.level == null || mc.getConnection() == null) {
+                      lastLevel = null;
+                      hasLastPos = false;
+                      tracked.clear();
+                      return;
+                  }
+
+                  long graceTicks = Math.max(0, config.arrivalGraceSeconds) * 20L;
+
+                  // Зашли в новый мир / сменился мир: заново начинаем "период прибытия"
+                  if (mc.level != lastLevel) {
+                      lastLevel = mc.level;
+                      tracked.clear();
+                      graceUntil = tick + graceTicks;
+                      hasLastPos = false;
+                  }
+
+                  // Сами резко переместились (/spawn, /home, тп): тоже период прибытия
+                  double px = mc.player.getX();
+                  double py = mc.player.getY();
+                  double pz = mc.player.getZ();
+                  if (hasLastPos) {
+                      double dx = px - lastX, dy = py - lastY, dz = pz - lastZ;
+                      if (dx * dx + dy * dy + dz * dz > 100.0) {
+                          tracked.clear();
+                          graceUntil = tick + graceTicks;
+                      }
+                  }
+                  lastX = px;
+                  lastY = py;
+                  lastZ = pz;
+                  hasLastPos = true;
+
+                  if (!enabled) return;
+
+                  Set<UUID> seen = new HashSet<>();
 
                   for (AbstractClientPlayer other : mc.level.players()) {
                       if (other == mc.player) continue;
 
-                      // Только настоящие игроки из таба (отсекает NPC/голограммы-манекены)
-                      if (mc.getConnection().getPlayerInfo(other.getUUID()) == null) continue;
+                      UUID id = other.getUUID();
+
+                      // Только настоящие игроки из таба
+                      if (mc.getConnection().getPlayerInfo(id) == null) continue;
+
+                      // UUID версии 2 используют плагины NPC (Citizens и подобные), у игроков 3 или 4
+                      if (id.version() == 2) continue;
 
                       String name = other.getName().getString();
                       if (isIgnored(name)) continue;
+
+                      seen.add(id);
+
+                      Track t = tracked.get(id);
+                      if (t == null) {
+                          t = new Track();
+                          t.x = other.getX();
+                          t.y = other.getY();
+                          t.z = other.getZ();
+                          t.arrival = tick <= graceUntil;
+                          tracked.put(id, t);
+                      } else if (!t.moved) {
+                          double dx = other.getX() - t.x;
+                          double dy = other.getY() - t.y;
+                          double dz = other.getZ() - t.z;
+                          if (dx * dx + dy * dy + dz * dz > 0.0025) t.moved = true;
+                      }
+
+                      // Неподвижный игрок, который был на месте сразу при заходе/телепорте = NPC на спавне
+                      if (t.arrival && !t.moved) continue;
 
                       if (mc.player.distanceTo(other) <= config.radius) {
                           leave(mc, name);
                           return;
                       }
                   }
+
+                  tracked.keySet().retainAll(seen);
               }
 
               private static boolean isIgnored(String name) {
@@ -259,6 +348,7 @@ jobs:
 
               private static void leave(Minecraft mc, String playerName) {
                   LOGGER.info("Рядом игрок {}, выхожу с сервера", playerName);
+                  enabled = false; // после возвращения мод снова выключен, чтобы не кикать в лобби
                   mc.getConnection().getConnection().disconnect(
                           Component.literal("AutoLeave: рядом игрок " + playerName)
                   );
@@ -276,5 +366,4 @@ jobs:
           path: |
             proj/build/libs/autoleave-*.jar
             !proj/build/libs/*-sources.jar
-
             
