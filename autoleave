@@ -1,0 +1,278 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.14.3
+
+      - name: Create project files
+        run: |
+          mkdir -p proj
+          cd proj
+          mkdir -p "$(dirname gradle.properties)"
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+
+          minecraft_version=1.21.11
+          loader_version=0.19.3
+          fabric_version=0.139.5+1.21.11
+
+          mod_version=1.0.0
+          maven_group=com.autoleave
+          archives_base_name=autoleave
+          EOF
+          mkdir -p "$(dirname settings.gradle)"
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          rootProject.name = 'autoleave'
+          EOF
+          mkdir -p "$(dirname build.gradle)"
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'fabric-loom' version '1.14-SNAPSHOT'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          repositories {
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings loom.officialMojangMappings()
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") {
+                  expand "version": inputs.properties.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 21
+          }
+
+          java {
+              withSourcesJar()
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          EOF
+          mkdir -p "$(dirname src/main/resources/fabric.mod.json)"
+          cat > src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "autoleave",
+            "version": "${version}",
+            "name": "AutoLeave",
+            "description": "Автоматически выходит с сервера, если рядом появился другой игрок. Вкл/выкл одной кнопкой.",
+            "authors": ["you"],
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["com.autoleave.AutoLeaveClient"]
+            },
+            "depends": {
+              "fabricloader": ">=0.18.0",
+              "minecraft": "~1.21.11",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          EOF
+          mkdir -p "$(dirname src/main/resources/assets/autoleave/lang/en_us.json)"
+          cat > src/main/resources/assets/autoleave/lang/en_us.json <<'EOF'
+          {
+            "key.autoleave.toggle": "Toggle AutoLeave"
+          }
+          EOF
+          mkdir -p "$(dirname src/main/resources/assets/autoleave/lang/ru_ru.json)"
+          cat > src/main/resources/assets/autoleave/lang/ru_ru.json <<'EOF'
+          {
+            "key.autoleave.toggle": "Вкл/выкл AutoLeave"
+          }
+          EOF
+          mkdir -p "$(dirname src/main/java/com/autoleave/AutoLeaveConfig.java)"
+          cat > src/main/java/com/autoleave/AutoLeaveConfig.java <<'EOF'
+          package com.autoleave;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import net.fabricmc.loader.api.FabricLoader;
+
+          import java.io.IOException;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.ArrayList;
+          import java.util.List;
+
+          /**
+           * Настройки лежат в config/autoleave.json
+           *  enabled - включён ли мод (запоминается между запусками)
+           *  radius  - дистанция в блоках, при которой срабатывает выход
+           *  ignore  - ники, которых мод игнорирует (друзья, альты)
+           */
+          public class AutoLeaveConfig {
+              private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+              private static final Path FILE = FabricLoader.getInstance().getConfigDir().resolve("autoleave.json");
+
+              public boolean enabled = false;
+              public double radius = 48.0;
+              public List<String> ignore = new ArrayList<>();
+
+              public static AutoLeaveConfig load() {
+                  if (Files.exists(FILE)) {
+                      try {
+                          String json = Files.readString(FILE, StandardCharsets.UTF_8);
+                          AutoLeaveConfig cfg = GSON.fromJson(json, AutoLeaveConfig.class);
+                          if (cfg != null) {
+                              if (cfg.ignore == null) cfg.ignore = new ArrayList<>();
+                              if (cfg.radius <= 0) cfg.radius = 48.0;
+                              return cfg;
+                          }
+                      } catch (Exception e) {
+                          AutoLeaveClient.LOGGER.warn("Не удалось прочитать конфиг, использую значения по умолчанию", e);
+                      }
+                  }
+                  AutoLeaveConfig cfg = new AutoLeaveConfig();
+                  cfg.save();
+                  return cfg;
+              }
+
+              public void save() {
+                  try {
+                      Files.writeString(FILE, GSON.toJson(this), StandardCharsets.UTF_8);
+                  } catch (IOException e) {
+                      AutoLeaveClient.LOGGER.warn("Не удалось сохранить конфиг", e);
+                  }
+              }
+          }
+          EOF
+          mkdir -p "$(dirname src/main/java/com/autoleave/AutoLeaveClient.java)"
+          cat > src/main/java/com/autoleave/AutoLeaveClient.java <<'EOF'
+          package com.autoleave;
+
+          import com.mojang.blaze3d.platform.InputConstants;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.minecraft.client.KeyMapping;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.client.player.AbstractClientPlayer;
+          import net.minecraft.network.chat.Component;
+          import org.lwjgl.glfw.GLFW;
+          import org.slf4j.Logger;
+          import org.slf4j.LoggerFactory;
+
+          import java.util.Locale;
+
+          public class AutoLeaveClient implements ClientModInitializer {
+              public static final Logger LOGGER = LoggerFactory.getLogger("autoleave");
+
+              private static AutoLeaveConfig config;
+              private static KeyMapping toggleKey;
+
+              @Override
+              public void onInitializeClient() {
+                  config = AutoLeaveConfig.load();
+
+                  // Одна кнопка вкл/выкл. По умолчанию K, меняется в настройках управления (раздел "Прочее").
+                  toggleKey = KeyBindingHelper.registerKeyBinding(new KeyMapping(
+                          "key.autoleave.toggle",
+                          InputConstants.Type.KEYSYM,
+                          GLFW.GLFW_KEY_K,
+                          KeyMapping.Category.MISC
+                  ));
+
+                  ClientTickEvents.END_CLIENT_TICK.register(AutoLeaveClient::onTick);
+                  LOGGER.info("AutoLeave загружен, enabled={}, radius={}", config.enabled, config.radius);
+              }
+
+              private static void onTick(Minecraft mc) {
+                  // Переключение кнопкой
+                  while (toggleKey.consumeClick()) {
+                      config.enabled = !config.enabled;
+                      config.save();
+                      if (mc.player != null) {
+                          mc.player.displayClientMessage(
+                                  Component.literal("AutoLeave: " + (config.enabled ? "ВКЛ" : "ВЫКЛ")),
+                                  true
+                          );
+                      }
+                  }
+
+                  if (!config.enabled) return;
+                  if (mc.player == null || mc.level == null || mc.getConnection() == null) return;
+
+                  for (AbstractClientPlayer other : mc.level.players()) {
+                      if (other == mc.player) continue;
+
+                      // Только настоящие игроки из таба (отсекает NPC/голограммы-манекены)
+                      if (mc.getConnection().getPlayerInfo(other.getUUID()) == null) continue;
+
+                      String name = other.getName().getString();
+                      if (isIgnored(name)) continue;
+
+                      if (mc.player.distanceTo(other) <= config.radius) {
+                          leave(mc, name);
+                          return;
+                      }
+                  }
+              }
+
+              private static boolean isIgnored(String name) {
+                  String lower = name.toLowerCase(Locale.ROOT);
+                  for (String ignored : config.ignore) {
+                      if (ignored != null && ignored.toLowerCase(Locale.ROOT).equals(lower)) return true;
+                  }
+                  return false;
+              }
+
+              private static void leave(Minecraft mc, String playerName) {
+                  LOGGER.info("Рядом игрок {}, выхожу с сервера", playerName);
+                  mc.getConnection().getConnection().disconnect(
+                          Component.literal("AutoLeave: рядом игрок " + playerName)
+                  );
+              }
+          }
+          EOF
+
+      - name: Build
+        working-directory: proj
+        run: gradle build --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: autoleave-jar
+          path: |
+            proj/build/libs/autoleave-*.jar
+            !proj/build/libs/*-sources.jar
