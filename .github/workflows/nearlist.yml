@@ -206,15 +206,15 @@ jobs:
 
                   list.sort((a, b) -> Float.compare(a.dist, b.dist));
                   int total = list.size();
-                  int max = Math.max(1, config.maxLines);
+                  int max = Math.max(1, config.maxPlayers);
                   if (list.size() > max) list = new ArrayList<>(list.subList(0, max));
 
                   Font font = mc.font;
                   String title = "Рядом: " + total;
 
-                  int x = config.x;
-                  int y = config.y;
-                  int lineH = 11;
+                  int x = 0;
+                  int y = 0;
+                  int lineH = 10;
                   int width = font.width(title);
                   List<String> lines = new ArrayList<>();
                   for (Entry e : list) {
@@ -222,16 +222,22 @@ jobs:
                       lines.add(line);
                       width = Math.max(width, font.width(line));
                   }
-                  width += 10;
+                  width += 8;
                   int height = 6 + lineH * (lines.size() + 1);
 
+                  g.pose().pushMatrix();
+                  g.pose().translate((float) config.x, (float) config.y);
+                  g.pose().scale(config.scale, config.scale);
+
                   g.fill(x, y, x + width, y + height, 0x90000000);
-                  g.drawString(font, title, x + 5, y + 4, 0xFFFFAA33);
-                  int ly = y + 4 + lineH;
+                  g.drawString(font, title, x + 4, y + 3, 0xFFFFAA33);
+                  int ly = y + 3 + lineH;
                   for (String line : lines) {
-                      g.drawString(font, line, x + 5, ly, 0xFFFFFFFF);
+                      g.drawString(font, line, x + 4, ly, 0xFFFFFFFF);
                       ly += lineH;
                   }
+
+                  g.pose().popMatrix();
               }
           }
           EOF
@@ -252,7 +258,8 @@ jobs:
            * Настройки лежат в config/nearlist.json
            *  visibleOnStart - показывать панель сразу при запуске игры (кнопка I переключает)
            *  radius         - дальше скольки блоков игроки не показываются
-           *  maxLines       - максимум строк в списке
+           *  maxPlayers     - максимум игроков в списке
+           *  scale          - размер панели (0.75 = поменьше, 1.0 = обычный)
            *  hideWhenEmpty  - прятать панель, когда рядом никого нет
            *  x, y           - положение панели на экране
            */
@@ -262,7 +269,8 @@ jobs:
 
               public boolean visibleOnStart = true;
               public double radius = 128.0;
-              public int maxLines = 6;
+              public int maxPlayers = 5;     // максимум игроков в списке
+              public float scale = 0.75f;    // размер панели (1.0 = обычный, меньше = компактнее)
               public boolean hideWhenEmpty = true;
               public int x = 6;
               public int y = 40;
@@ -274,7 +282,8 @@ jobs:
                           NearListConfig cfg = GSON.fromJson(json, NearListConfig.class);
                           if (cfg != null) {
                               if (cfg.radius <= 0) cfg.radius = 128.0;
-                              if (cfg.maxLines <= 0) cfg.maxLines = 6;
+                              if (cfg.maxPlayers <= 0) cfg.maxPlayers = 5;
+                              if (cfg.scale < 0.3f || cfg.scale > 3.0f) cfg.scale = 0.75f;
                               cfg.save();
                               return cfg;
                           }
