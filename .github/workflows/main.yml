@@ -150,6 +150,7 @@ jobs:
 
               public double radius = 48.0;
               public int arrivalGraceSeconds = 10;
+              public boolean sound = true; // сигнал при срабатывании (false = без звука)
               public List<String> ignore = new ArrayList<>();
 
               public static AutoLeaveConfig load() {
@@ -192,6 +193,8 @@ jobs:
           import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
           import net.minecraft.client.KeyMapping;
           import net.minecraft.client.Minecraft;
+          import net.minecraft.client.resources.sounds.SimpleSoundInstance;
+          import net.minecraft.sounds.SoundEvents;
           import net.minecraft.client.multiplayer.ClientLevel;
           import net.minecraft.client.player.AbstractClientPlayer;
           import net.minecraft.network.chat.Component;
@@ -214,6 +217,9 @@ jobs:
 
               /** Каждый запуск игры начинается с ВЫКЛ. Включается кнопкой, на фермерской точке. */
               private static boolean enabled = false;
+
+              /** После выхода сигнал проигрывается ещё раз уже в меню, на случай если игра оборвала первый. */
+              private static boolean alarmPending = false;
 
               private static long tick = 0;
               private static long graceUntil = 0;
@@ -259,6 +265,10 @@ jobs:
                   }
 
                   if (mc.player == null || mc.level == null || mc.getConnection() == null) {
+                      if (alarmPending) {
+                          alarmPending = false;
+                          playAlarm(mc);
+                      }
                       lastLevel = null;
                       hasLastPos = false;
                       tracked.clear();
@@ -347,6 +357,15 @@ jobs:
                   tracked.keySet().retainAll(seen);
               }
 
+              private static void playAlarm(Minecraft mc) {
+                  try {
+                      mc.getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.ENDER_DRAGON_GROWL, 1.0F, 1.0F));
+                      mc.getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.WITHER_SPAWN, 1.5F, 1.0F));
+                  } catch (Exception e) {
+                      LOGGER.warn("Не удалось проиграть сигнал", e);
+                  }
+              }
+
               /** Убирает цветовые коды, пробелы и регистр, чтобы имена сравнивались надёжно. */
               private static String norm(String s) {
                   if (s == null) return "";
@@ -365,6 +384,10 @@ jobs:
               private static void leave(Minecraft mc, String name, String profileName, UUID id, float dist) {
                   LOGGER.info("Рядом игрок name='{}' profile='{}' uuid={} dist={}, выхожу с сервера", name, profileName, id, dist);
                   enabled = false; // после возвращения мод снова выключен, чтобы не кикать в лобби
+                  if (config.sound) {
+                      playAlarm(mc);
+                      alarmPending = true;
+                  }
                   mc.getConnection().getConnection().disconnect(
                           Component.literal("AutoLeave: рядом игрок " + name
                                   + " (профиль " + profileName + ", дистанция " + (int) dist
@@ -384,4 +407,4 @@ jobs:
           path: |
             proj/build/libs/autoleave-*.jar
             !proj/build/libs/*-sources.jar
-            
+            w
