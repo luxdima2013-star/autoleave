@@ -1,0 +1,344 @@
+name: build-nearlist
+
+on:
+  push:
+    paths:
+      - '.github/workflows/nearlist.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.2.0
+
+      - name: Create project files
+        run: |
+          mkdir -p proj
+          cd proj
+          mkdir -p "$(dirname build.gradle)"
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'fabric-loom' version '1.14-SNAPSHOT'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          repositories {
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings loom.officialMojangMappings()
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") {
+                  expand "version": inputs.properties.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 21
+          }
+
+          java {
+              withSourcesJar()
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          EOF
+          mkdir -p "$(dirname gradle.properties)"
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+
+          minecraft_version=1.21.11
+          loader_version=0.19.3
+          fabric_version=0.139.5+1.21.11
+
+          mod_version=1.0.0
+          maven_group=com.nearlist
+          archives_base_name=nearlist
+          EOF
+          mkdir -p "$(dirname settings.gradle)"
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          rootProject.name = 'nearlist'
+          EOF
+          mkdir -p "$(dirname src/main/java/com/nearlist/NearListClient.java)"
+          cat > src/main/java/com/nearlist/NearListClient.java <<'EOF'
+          package com.nearlist;
+
+          import com.mojang.blaze3d.platform.InputConstants;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
+          import net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements;
+          import net.minecraft.client.DeltaTracker;
+          import net.minecraft.client.KeyMapping;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.client.gui.Font;
+          import net.minecraft.client.gui.GuiGraphics;
+          import net.minecraft.client.player.AbstractClientPlayer;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.resources.Identifier;
+          import net.minecraft.util.Mth;
+          import org.lwjgl.glfw.GLFW;
+          import org.slf4j.Logger;
+          import org.slf4j.LoggerFactory;
+
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.UUID;
+
+          /** Список игроков рядом: ник, расстояние и стрелка направления (относительно того, куда ты смотришь). */
+          public class NearListClient implements ClientModInitializer {
+              public static final Logger LOGGER = LoggerFactory.getLogger("nearlist");
+
+              // ↑ ↗ → ↘ ↓ ↙ ← ↖
+              private static final String[] ARROWS = {"↑", "↗", "→", "↘", "↓", "↙", "←", "↖"};
+
+              private static NearListConfig config;
+              private static KeyMapping toggleKey;
+              private static boolean visible = true;
+
+              private static class Entry {
+                  String name;
+                  float dist;
+                  String arrow;
+              }
+
+              @Override
+              public void onInitializeClient() {
+                  config = NearListConfig.load();
+                  visible = config.visibleOnStart;
+
+                  // Кнопка I показывает и скрывает панель (меняется в настройках управления, раздел "Прочее")
+                  toggleKey = KeyBindingHelper.registerKeyBinding(new KeyMapping(
+                          "key.nearlist.toggle",
+                          InputConstants.Type.KEYSYM,
+                          GLFW.GLFW_KEY_I,
+                          KeyMapping.Category.MISC
+                  ));
+
+                  ClientTickEvents.END_CLIENT_TICK.register(NearListClient::onTick);
+
+                  HudElementRegistry.attachElementBefore(
+                          VanillaHudElements.CHAT,
+                          Identifier.fromNamespaceAndPath("nearlist", "list"),
+                          NearListClient::render
+                  );
+                  LOGGER.info("NearList загружен, radius={}", config.radius);
+              }
+
+              private static void onTick(Minecraft mc) {
+                  while (toggleKey.consumeClick()) {
+                      visible = !visible;
+                      if (mc.player != null) {
+                          mc.player.displayClientMessage(
+                                  Component.literal("NearList: " + (visible ? "ВКЛ" : "ВЫКЛ")),
+                                  true
+                          );
+                      }
+                  }
+              }
+
+              private static void render(GuiGraphics g, DeltaTracker tickCounter) {
+                  if (!visible) return;
+                  Minecraft mc = Minecraft.getInstance();
+                  if (mc.player == null || mc.level == null || mc.getConnection() == null) return;
+                  if (mc.options.hideGui) return;
+
+                  double px = mc.player.getX();
+                  double pz = mc.player.getZ();
+                  float yaw = mc.player.getYRot();
+                  UUID selfId = mc.player.getUUID();
+
+                  List<Entry> list = new ArrayList<>();
+                  for (AbstractClientPlayer other : mc.level.players()) {
+                      if (other == mc.player) continue;
+                      UUID id = other.getUUID();
+                      if (id.equals(selfId)) continue;
+                      if (mc.getConnection().getPlayerInfo(id) == null) continue; // не из таба: NPC, манекены
+                      if (id.version() == 2) continue; // NPC плагинов (Citizens и т.п.)
+
+                      float dist = mc.player.distanceTo(other);
+                      if (dist > config.radius) continue;
+
+                      double dx = other.getX() - px;
+                      double dz = other.getZ() - pz;
+                      float yawTo = (float) Math.toDegrees(Math.atan2(-dx, dz));
+                      float rel = Mth.wrapDegrees(yawTo - yaw);
+                      int idx = Math.floorMod(Math.round(rel / 45.0f), 8);
+
+                      Entry e = new Entry();
+                      e.name = other.getName().getString();
+                      e.dist = dist;
+                      e.arrow = ARROWS[idx];
+                      list.add(e);
+                  }
+
+                  if (list.isEmpty() && config.hideWhenEmpty) return;
+
+                  list.sort((a, b) -> Float.compare(a.dist, b.dist));
+                  int total = list.size();
+                  int max = Math.max(1, config.maxLines);
+                  if (list.size() > max) list = new ArrayList<>(list.subList(0, max));
+
+                  Font font = mc.font;
+                  String title = "Рядом: " + total;
+
+                  int x = config.x;
+                  int y = config.y;
+                  int lineH = 11;
+                  int width = font.width(title);
+                  List<String> lines = new ArrayList<>();
+                  for (Entry e : list) {
+                      String line = e.name + "  " + (int) e.dist + "m  " + e.arrow;
+                      lines.add(line);
+                      width = Math.max(width, font.width(line));
+                  }
+                  width += 10;
+                  int height = 6 + lineH * (lines.size() + 1);
+
+                  g.fill(x, y, x + width, y + height, 0x90000000);
+                  g.drawString(font, title, x + 5, y + 4, 0xFFFFAA33);
+                  int ly = y + 4 + lineH;
+                  for (String line : lines) {
+                      g.drawString(font, line, x + 5, ly, 0xFFFFFFFF);
+                      ly += lineH;
+                  }
+              }
+          }
+          EOF
+          mkdir -p "$(dirname src/main/java/com/nearlist/NearListConfig.java)"
+          cat > src/main/java/com/nearlist/NearListConfig.java <<'EOF'
+          package com.nearlist;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import net.fabricmc.loader.api.FabricLoader;
+
+          import java.io.IOException;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+
+          /**
+           * Настройки лежат в config/nearlist.json
+           *  visibleOnStart - показывать панель сразу при запуске игры (кнопка I переключает)
+           *  radius         - дальше скольки блоков игроки не показываются
+           *  maxLines       - максимум строк в списке
+           *  hideWhenEmpty  - прятать панель, когда рядом никого нет
+           *  x, y           - положение панели на экране
+           */
+          public class NearListConfig {
+              private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+              private static final Path FILE = FabricLoader.getInstance().getConfigDir().resolve("nearlist.json");
+
+              public boolean visibleOnStart = true;
+              public double radius = 128.0;
+              public int maxLines = 6;
+              public boolean hideWhenEmpty = true;
+              public int x = 6;
+              public int y = 40;
+
+              public static NearListConfig load() {
+                  if (Files.exists(FILE)) {
+                      try {
+                          String json = Files.readString(FILE, StandardCharsets.UTF_8);
+                          NearListConfig cfg = GSON.fromJson(json, NearListConfig.class);
+                          if (cfg != null) {
+                              if (cfg.radius <= 0) cfg.radius = 128.0;
+                              if (cfg.maxLines <= 0) cfg.maxLines = 6;
+                              cfg.save();
+                              return cfg;
+                          }
+                      } catch (Exception e) {
+                          NearListClient.LOGGER.warn("Не удалось прочитать конфиг, использую значения по умолчанию", e);
+                      }
+                  }
+                  NearListConfig cfg = new NearListConfig();
+                  cfg.save();
+                  return cfg;
+              }
+
+              public void save() {
+                  try {
+                      Files.writeString(FILE, GSON.toJson(this), StandardCharsets.UTF_8);
+                  } catch (IOException e) {
+                      NearListClient.LOGGER.warn("Не удалось сохранить конфиг", e);
+                  }
+              }
+          }
+          EOF
+          mkdir -p "$(dirname src/main/resources/assets/nearlist/lang/en_us.json)"
+          cat > src/main/resources/assets/nearlist/lang/en_us.json <<'EOF'
+          {
+            "key.nearlist.toggle": "Toggle nearby players list"
+          }
+          EOF
+          mkdir -p "$(dirname src/main/resources/assets/nearlist/lang/ru_ru.json)"
+          cat > src/main/resources/assets/nearlist/lang/ru_ru.json <<'EOF'
+          {
+            "key.nearlist.toggle": "Показать/скрыть список игроков рядом"
+          }
+          EOF
+          mkdir -p "$(dirname src/main/resources/fabric.mod.json)"
+          cat > src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "nearlist",
+            "version": "${version}",
+            "name": "NearList",
+            "description": "Список игроков рядом: ник, расстояние и стрелка направления. Кнопка I показывает и скрывает.",
+            "authors": ["you"],
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["com.nearlist.NearListClient"]
+            },
+            "depends": {
+              "fabricloader": ">=0.18.0",
+              "minecraft": "~1.21.11",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          EOF
+
+      - name: Build
+        working-directory: proj
+        run: gradle build --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nearlist-jar
+          path: |
+            proj/build/libs/nearlist-*.jar
+            !proj/build/libs/*-sources.jar
+            
