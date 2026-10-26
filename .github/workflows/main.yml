@@ -151,6 +151,8 @@ jobs:
               public double radius = 48.0;
               public int arrivalGraceSeconds = 10;
               public boolean sound = true; // сигнал при срабатывании (false = без звука)
+              public boolean forceSound = true;   // играть сигнал, даже если общая громкость в игре на нуле
+              public double alarmVolume = 1.0;    // громкость на время сигнала (0.1 - 1.0)
               public List<String> ignore = new ArrayList<>();
 
               public static AutoLeaveConfig load() {
@@ -162,6 +164,7 @@ jobs:
                               if (cfg.ignore == null) cfg.ignore = new ArrayList<>();
                               if (cfg.radius <= 0) cfg.radius = 48.0;
                               if (cfg.arrivalGraceSeconds < 0) cfg.arrivalGraceSeconds = 10;
+                              if (cfg.alarmVolume < 0.1 || cfg.alarmVolume > 1.0) cfg.alarmVolume = 1.0;
                               cfg.save();
                               return cfg;
                           }
@@ -195,6 +198,7 @@ jobs:
           import net.minecraft.client.Minecraft;
           import net.minecraft.client.resources.sounds.SimpleSoundInstance;
           import net.minecraft.sounds.SoundEvents;
+          import net.minecraft.sounds.SoundSource;
           import net.minecraft.client.multiplayer.ClientLevel;
           import net.minecraft.client.player.AbstractClientPlayer;
           import net.minecraft.network.chat.Component;
@@ -220,6 +224,11 @@ jobs:
 
               /** После выхода сигнал проигрывается ещё раз уже в меню, на случай если игра оборвала первый. */
               private static boolean alarmPending = false;
+
+              /** Общая громкость временно поднята на время сигнала; потом возвращается как была. */
+              private static boolean volumeBoosted = false;
+              private static double originalMaster = 1.0;
+              private static long restoreVolumeAt = 0;
 
               private static long tick = 0;
               private static long graceUntil = 0;
@@ -252,6 +261,15 @@ jobs:
 
               private static void onTick(Minecraft mc) {
                   tick++;
+
+                  if (volumeBoosted && tick >= restoreVolumeAt) {
+                      volumeBoosted = false;
+                      try {
+                          mc.options.getSoundSourceOptionInstance(SoundSource.MASTER).set(originalMaster);
+                      } catch (Exception e) {
+                          LOGGER.warn("Не удалось вернуть громкость", e);
+                      }
+                  }
 
                   while (toggleKey.consumeClick()) {
                       enabled = !enabled;
@@ -359,6 +377,17 @@ jobs:
 
               private static void playAlarm(Minecraft mc) {
                   try {
+                      if (config.forceSound) {
+                          var master = mc.options.getSoundSourceOptionInstance(SoundSource.MASTER);
+                          if (!volumeBoosted) {
+                              originalMaster = master.get();
+                              volumeBoosted = true;
+                          }
+                          if (master.get() < config.alarmVolume) {
+                              master.set(config.alarmVolume);
+                          }
+                          restoreVolumeAt = tick + 100; // ~5 секунд
+                      }
                       mc.getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.ENDER_DRAGON_GROWL, 1.0F, 1.0F));
                       mc.getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.WITHER_SPAWN, 1.5F, 1.0F));
                   } catch (Exception e) {
@@ -407,4 +436,4 @@ jobs:
           path: |
             proj/build/libs/autoleave-*.jar
             !proj/build/libs/*-sources.jar
-            w
+            
